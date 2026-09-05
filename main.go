@@ -1,15 +1,23 @@
-// embed-proxy v1.0.0
+// embed-proxy v1.1.0
 // SiliconFlow Embedding 清洗代理
-// 核心功能：接收 /v1/embeddings 请求，删除 encoding_format 字段后转发给硅基流动，
-//          解决 LiteLLM/OpenWebUI 注入 "encoding_format":null 导致硅基返回 20015 参数非法的问题。
-// 附带功能：内网穿透友好（默认监听 0.0.0.0，可被 cloudflared/frp 等隧道直接转发）；
-//          交互菜单支持一键安装 systemd 服务（开机自启）、卸载、改端口。
+// 核心功能：
+//  1. 接收 /v1/embeddings，删除 encoding_format 字段后转发上游，解决 LiteLLM/OpenWebUI
+//     注入 "encoding_format":null 导致硅基返回 20015 参数非法的问题
+//  2. 全局 API Key 鉴权：请求必须携带 Authorization: Bearer <proxy_auth_key>，防止公网滥用
+//  3. 自定义路由映射：/v1/audio/transcriptions -> /v1/chat/completions 等任意路径改写
+//  4. 自定义上游 API 地址（默认硅基流动 https://api.siliconflow.cn/v1）
+//
+// 附带功能：内网穿透友好（默认监听 0.0.0.0）；交互菜单一键安装 systemd 服务（开机自启）、卸载、
+//
+//	改端口、设 Key、改上游、管理路由映射；重装服务自动保留已有配置。
 package main
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,35 +35,55 @@ import (
 )
 
 const (
-	version          = "1.0.0"
-	defaultPort      = 16540
-	defaultUpstream  = "https://api.siliconflow.cn/v1"
-	configDir        = "/etc/embed-proxy"
-	configPath       = "/etc/embed-proxy/config.json"
-	binPath          = "/usr/local/bin/embed-proxy"
-	unitPath         = "/etc/systemd/system/embed-proxy.service"
-	serviceName      = "embed-proxy.service"
-	envKeyVar        = "SILICONFLOW_API_KEY"
-	envPortVar       = "EMBED_PROXY_PORT"
-	requestTimeout   = 120 * time.Second
-	upstreamEndpoint = "/embeddings"
+	version         = "1.1.0"
+	defaultPort     = 16540
+	defaultUpstream = "https://api.siliconflow.cn/v1"
+	configDir       = "/etc/embed-proxy"
+	configPath      = "/etc/embed-proxy/config.json"
+	binPath         = "/usr/local/bin/embed-proxy"
+	unitPath        = "/etc/systemd/system/embed-proxy.service"
+	serviceName     = "embed-proxy.service"
+	envKeyVar       = "SILICONFLOW_API_KEY"
+	envPortVar      = "EMBED_PROXY_PORT"
+	requestTimeout  = 120 * time.Second
+	embeddingPath   = "/v1/embeddings"
+	maxBodySize     = 32 << 20
 )
+
+// RouteMapping 自定义路由映射：Source 命中后转发到 Target
+type RouteMapping struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+}
 
 // Config 代理配置
 type Config struct {
-	Port              int    `json:"port"`
-	SiliconflowAPIKey string `json:"siliconflow_api_key"`
-	UpstreamBase      string `json:"upstream_base"`
+	Port              int            `json:"port"`
+	SiliconflowAPIKey string         `json:"siliconflow_api_key"` // 上游 API Key（硅基）
+	UpstreamBase      string         `json:"upstream_base"`       // 自定义上游地址，默认硅基
+	ProxyAuthKey      string         `json:"proxy_auth_key"`      // 代理访问鉴权 Key（防公网滥用）
+	RouteMappings     []RouteMapping `json:"route_mappings"`      // 自定义路由映射
+}
+
+func randomKey(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("k%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 func defaultConfig() Config {
 	return Config{
 		Port:         defaultPort,
 		UpstreamBase: defaultUpstream,
+		ProxyAuthKey: randomKey(24), // 首次运行自动生成随机鉴权 Key
+		RouteMappings: []RouteMapping{
+			{Source: "/v1/audio/transcriptions", Target: "/v1/chat/completions"},
+		},
 	}
 }
 
-// envOr 环境变量取配置路径（默认 /etc/embed-proxy/config.json）
 func configPathEnv() string {
 	if v := os.Getenv("EMBED_PROXY_CONFIG"); v != "" {
 		return v
@@ -66,6 +94,14 @@ func configPathEnv() string {
 func loadConfig(path string) (Config, error) {
 	cfg := defaultConfig()
 	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		// 首次运行：生成默认配置（含随机鉴权 Key）并落盘，保证 Key 可查
+		if err := saveConfig(path, cfg); err != nil {
+			return cfg, err
+		}
+		logf("[config] 已生成默认配置 %s，请用菜单查看/修改 代理鉴权 Key", path)
+		return cfg, nil
+	}
 	if err != nil {
 		return cfg, err
 	}
@@ -77,6 +113,9 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.UpstreamBase == "" {
 		cfg.UpstreamBase = defaultUpstream
+	}
+	if cfg.RouteMappings == nil {
+		cfg.RouteMappings = defaultConfig().RouteMappings
 	}
 	// 环境变量优先
 	if v := os.Getenv(envKeyVar); v != "" {
@@ -103,6 +142,31 @@ func saveConfig(path string, cfg Config) error {
 
 // ---------- HTTP 代理 ----------
 
+// resolveRoute 根据自定义路由映射改写路径，未命中原样返回
+func resolveRoute(path string, mappings []RouteMapping) string {
+	for _, m := range mappings {
+		if m.Source == path {
+			return m.Target
+		}
+	}
+	return path
+}
+
+// buildUpstreamURL 拼接上游地址与目标路径，自动去重 /v1 前缀
+// 例: base=https://api.siliconflow.cn/v1, target=/v1/chat/completions
+//
+//	-> https://api.siliconflow.cn/v1/chat/completions
+func buildUpstreamURL(base, target string) string {
+	base = strings.TrimRight(base, "/")
+	if strings.HasSuffix(base, "/v1") && strings.HasPrefix(target, "/v1") {
+		target = strings.TrimPrefix(target, "/v1")
+		if target == "" {
+			target = "/"
+		}
+	}
+	return base + target
+}
+
 func newProxyHandler(cfg *Config) http.Handler {
 	mux := http.NewServeMux()
 
@@ -111,32 +175,51 @@ func newProxyHandler(cfg *Config) http.Handler {
 		fmt.Fprintf(w, `{"status":"ok","port":%d,"version":"%s"}`, cfg.Port, version)
 	})
 
-	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 1. 全局鉴权：ProxyAuthKey 非空时校验 Bearer，防止公网被滥用
+		if cfg.ProxyAuthKey != "" && r.Header.Get("Authorization") != "Bearer "+cfg.ProxyAuthKey {
+			writeError(w, http.StatusUnauthorized, "invalid or missing API key")
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+
+		// 2. 自定义路由映射
+		targetPath := resolveRoute(r.URL.Path, cfg.RouteMappings)
+		upstreamURL := buildUpstreamURL(cfg.UpstreamBase, targetPath)
+
+		// 3. 读 body
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "read body failed: "+err.Error())
 			return
 		}
-		// 核心：删除 encoding_format 字段（LiteLLM 会注入 null）
-		cleaned, err := stripEncodingFormat(body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
-			return
+
+		// 4. embedding 请求：删除 encoding_format 字段（LiteLLM 注入 null 的根源）
+		if r.URL.Path == embeddingPath && len(body) > 0 {
+			cleaned, err := stripEncodingFormat(body)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+				return
+			}
+			body = cleaned
 		}
-		upstreamURL := strings.TrimRight(cfg.UpstreamBase, "/") + upstreamEndpoint
+
+		// 5. 转发上游（超时保护）
 		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(cleaned))
+		req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewReader(body))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "build upstream request failed")
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
+		// 透传请求头（Authorization 替换为上游 Key）
+		for k, v := range r.Header {
+			if !strings.EqualFold(k, "Authorization") && !strings.EqualFold(k, "Content-Length") {
+				req.Header[k] = v
+			}
+		}
 		req.Header.Set("Authorization", "Bearer "+cfg.SiliconflowAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+
 		client := &http.Client{Timeout: requestTimeout}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -149,10 +232,13 @@ func newProxyHandler(cfg *Config) http.Handler {
 			writeError(w, http.StatusBadGateway, "read upstream response failed")
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		// 透传上游响应头
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
-		logf("[proxy] %s %s -> %d (%d bytes)", r.Method, r.URL.Path, resp.StatusCode, len(respBody))
+		logf("[proxy] %s %s -> %s -> %d (%d bytes)", r.Method, r.URL.Path, targetPath, resp.StatusCode, len(respBody))
 	})
 
 	return logMiddleware(mux)
@@ -187,7 +273,6 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 
 func runServer(cfg Config) error {
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
-	// 预先探测端口占用
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("端口 %d 被占用或无法监听: %w", cfg.Port, err)
@@ -195,7 +280,12 @@ func runServer(cfg Config) error {
 	defer ln.Close()
 
 	if cfg.SiliconflowAPIKey == "" {
-		logf("[warn] 尚未设置硅基 API Key，embedding 请求将返回 401（请运行程序进入菜单设置，或设置环境变量 %s）", envKeyVar)
+		logf("[warn] 尚未设置上游 API Key，请求将返回 401（请用菜单设置，或设置环境变量 %s）", envKeyVar)
+	}
+	if cfg.ProxyAuthKey == "" {
+		logf("[warn] 代理鉴权 Key 为空，任何请求均可访问！公网暴露时请务必设置")
+	} else {
+		logf("[config] 代理鉴权 Key: %s（客户端请求需携带 Authorization: Bearer %s）", cfg.ProxyAuthKey, cfg.ProxyAuthKey)
 	}
 
 	srv := &http.Server{Handler: newProxyHandler(&cfg), ReadHeaderTimeout: 10 * time.Second}
@@ -219,10 +309,8 @@ func runServer(cfg Config) error {
 func isRoot() bool { return os.Geteuid() == 0 }
 
 func hasSystemd() bool {
-	if _, err := os.Stat("/run/systemd/system"); err != nil {
-		return false
-	}
-	return true
+	_, err := os.Stat("/run/systemd/system")
+	return err == nil
 }
 
 func systemctl(args ...string) error {
@@ -232,7 +320,7 @@ func systemctl(args ...string) error {
 	return cmd.Run()
 }
 
-// mergeExistingConfig 合并已存在的配置：已有配置中的 Key/端口/上游优先，
+// mergeExistingConfig 合并已存在的配置：已有配置中的 Key/端口/上游/鉴权/路由优先，
 // 确保重装/升级系统服务时用户已保存的数据不被覆盖丢失。
 func mergeExistingConfig(cfg Config) Config {
 	data, err := os.ReadFile(configPathEnv())
@@ -252,7 +340,13 @@ func mergeExistingConfig(cfg Config) Config {
 	if existing.UpstreamBase != "" {
 		cfg.UpstreamBase = existing.UpstreamBase
 	}
-	logf("[config] 检测到已有配置，已合并保留 (端口=%d, Key=%s)", cfg.Port, maskKey(cfg.SiliconflowAPIKey))
+	if existing.ProxyAuthKey != "" {
+		cfg.ProxyAuthKey = existing.ProxyAuthKey
+	}
+	if len(existing.RouteMappings) > 0 {
+		cfg.RouteMappings = existing.RouteMappings
+	}
+	logf("[config] 检测到已有配置，已合并保留 (端口=%d, 上游=%s)", cfg.Port, cfg.UpstreamBase)
 	return cfg
 }
 
@@ -264,7 +358,6 @@ func installService(cfg Config) error {
 	if !hasSystemd() {
 		return errors.New("未检测到 systemd（/run/systemd/system 不存在），无法安装系统服务")
 	}
-	// 复制自身
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -277,12 +370,11 @@ func installService(cfg Config) error {
 			return err
 		}
 	}
-	// 合并保留已有配置（Key/端口/上游），再落盘
+	// 合并保留已有配置，再落盘
 	cfg = mergeExistingConfig(cfg)
 	if err := saveConfig(configPathEnv(), cfg); err != nil {
 		return fmt.Errorf("写入配置失败: %w", err)
 	}
-	// 写 unit
 	unit := fmt.Sprintf(`[Unit]
 Description=SiliconFlow Embedding Proxy (embed-proxy)
 After=network-online.target
@@ -381,21 +473,25 @@ func printBanner(cfg Config) {
 			status = "运行中"
 		}
 	}
-	keyMasked := maskKey(cfg.SiliconflowAPIKey)
 	fmt.Println("==================================================")
-	fmt.Printf("  SiliconFlow Embedding 清洗代理 v%s\n", version)
-	fmt.Println("  功能: 删除 encoding_format 后转发硅基, 解决 20015 报错")
+	fmt.Printf("  Embedding 清洗代理 v%s（硅基流动适配）\n", version)
+	fmt.Println("  功能: encoding_format 清洗 / 全局鉴权 / 自定义路由 / 自定义上游")
 	fmt.Println("--------------------------------------------------")
-	fmt.Printf("  当前端口: %d (默认 %d)\n", cfg.Port, defaultPort)
-	fmt.Printf("  硅基 Key : %s\n", keyMasked)
+	fmt.Printf("  当前端口 : %d (默认 %d)\n", cfg.Port, defaultPort)
+	fmt.Printf("  上游地址 : %s\n", cfg.UpstreamBase)
+	fmt.Printf("  上游 Key : %s\n", maskKey(cfg.SiliconflowAPIKey))
+	fmt.Printf("  鉴权 Key : %s\n", maskKey(cfg.ProxyAuthKey))
 	fmt.Printf("  服务状态 : %s\n", status)
 	fmt.Println("--------------------------------------------------")
 	fmt.Println("  1) 安装为系统服务（开机自启动）")
 	fmt.Println("  2) 卸载系统服务")
 	fmt.Println("  3) 修改监听端口")
-	fmt.Println("  4) 设置/修改 硅基 API Key")
-	fmt.Println("  5) 前台启动代理（当前终端运行, Ctrl+C 停止）")
-	fmt.Println("  6) 查看服务状态")
+	fmt.Println("  4) 设置上游 API Key（硅基 sk-xxx）")
+	fmt.Println("  5) 设置代理鉴权 Key（公网防滥用）")
+	fmt.Println("  6) 修改上游 API 地址（默认硅基流动）")
+	fmt.Println("  7) 管理自定义路由映射")
+	fmt.Println("  8) 前台启动代理（当前终端, Ctrl+C 停止）")
+	fmt.Println("  9) 查看服务状态")
 	fmt.Println("  0) 退出")
 	fmt.Println("==================================================")
 }
@@ -411,9 +507,73 @@ func askYesNo(reader *bufio.Reader, prompt string) bool {
 	return ans == "y" || ans == "yes"
 }
 
+func manageRoutes(reader *bufio.Reader, cfg *Config) {
+	for {
+		fmt.Println("--------------------------------------------------")
+		fmt.Println("  当前路由映射规则:")
+		if len(cfg.RouteMappings) == 0 {
+			fmt.Println("    （无，所有路径原样转发）")
+		}
+		for i, r := range cfg.RouteMappings {
+			fmt.Printf("    %d. %s  ->  %s\n", i+1, r.Source, r.Target)
+		}
+		fmt.Println("--------------------------------------------------")
+		fmt.Println("  a) 添加规则    d) 删除规则   0) 返回")
+		fmt.Print("  请选择: ")
+		opt := readLine(reader)
+		switch opt {
+		case "a":
+			fmt.Print("  源路径（如 /v1/audio/transcriptions）: ")
+			src := readLine(reader)
+			fmt.Print("  目标路径（如 /v1/chat/completions）: ")
+			tgt := readLine(reader)
+			if src == "" || tgt == "" || !strings.HasPrefix(src, "/") || !strings.HasPrefix(tgt, "/") {
+				fmt.Println("  ❌ 路径必须以 / 开头且不能为空")
+				continue
+			}
+			// 覆盖已有同名源路径
+			found := false
+			for i := range cfg.RouteMappings {
+				if cfg.RouteMappings[i].Source == src {
+					cfg.RouteMappings[i].Target = tgt
+					found = true
+					break
+				}
+			}
+			if !found {
+				cfg.RouteMappings = append(cfg.RouteMappings, RouteMapping{Source: src, Target: tgt})
+			}
+			if err := saveConfig(configPathEnv(), *cfg); err != nil {
+				fmt.Printf("  ❌ 保存失败: %v\n", err)
+			} else {
+				fmt.Println("  ✅ 路由规则已保存")
+			}
+		case "d":
+			fmt.Print("  输入要删除的规则序号: ")
+			idxStr := readLine(reader)
+			idx, err := strconv.Atoi(idxStr)
+			if err != nil || idx < 1 || idx > len(cfg.RouteMappings) {
+				fmt.Println("  ❌ 序号不合法")
+				continue
+			}
+			cfg.RouteMappings = append(cfg.RouteMappings[:idx-1], cfg.RouteMappings[idx:]...)
+			if err := saveConfig(configPathEnv(), *cfg); err != nil {
+				fmt.Printf("  ❌ 保存失败: %v\n", err)
+			} else {
+				fmt.Println("  ✅ 已删除")
+			}
+		case "0":
+			return
+		default:
+			fmt.Println("  ❌ 无效选项")
+		}
+	}
+}
+
 func interactive() {
 	cfg, err := loadConfig(configPathEnv())
 	if err != nil {
+		fmt.Printf("加载配置失败: %v，使用默认配置\n", err)
 		cfg = defaultConfig()
 	}
 	reader := bufio.NewReader(os.Stdin)
@@ -429,7 +589,7 @@ func interactive() {
 				break
 			}
 			if cfg.SiliconflowAPIKey == "" {
-				fmt.Print("当前未设置硅基 API Key，请输入（形如 sk-xxxx）: ")
+				fmt.Print("当前未设置上游 API Key，请输入（形如 sk-xxxx）: ")
 				key := readLine(reader)
 				if key == "" {
 					fmt.Println("❌ 未输入 Key，取消安装")
@@ -445,7 +605,7 @@ func interactive() {
 				fmt.Println("❌ 需要 root 权限，请用 sudo 运行本程序")
 				break
 			}
-			del := askYesNo(reader, "是否【删除】配置文件（Key/端口将丢失）？选 n 保留配置")
+			del := askYesNo(reader, "是否【删除】配置文件（Key/端口/路由将丢失）？选 n 保留配置")
 			if err := uninstallService(!del); err != nil {
 				fmt.Printf("❌ 卸载失败: %v\n", err)
 			}
@@ -472,25 +632,58 @@ func interactive() {
 				}
 			}
 		case "4":
-			fmt.Print("请输入硅基 API Key（形如 sk-xxxx）: ")
+			fmt.Print("请输入上游 API Key（硅基 sk-xxxx）: ")
 			key := readLine(reader)
-			if !strings.HasPrefix(key, "sk-") && key != "" {
-				fmt.Println("⚠️ 输入看起来不像有效的硅基 Key（应以 sk- 开头），已保存，请确认")
+			if key == "" {
+				fmt.Println("❌ Key 不能为空")
+				break
 			}
-			if key != "" {
-				cfg.SiliconflowAPIKey = key
+			cfg.SiliconflowAPIKey = key
+			if err := saveConfig(configPathEnv(), cfg); err != nil {
+				fmt.Printf("❌ 保存失败: %v\n", err)
+			} else {
+				fmt.Println("✅ 上游 API Key 已保存")
+			}
+		case "5":
+			fmt.Printf("当前代理鉴权 Key: %s\n", cfg.ProxyAuthKey)
+			fmt.Print("输入新鉴权 Key（留空则随机生成）: ")
+			key := readLine(reader)
+			if key == "" {
+				key = randomKey(24)
+			}
+			cfg.ProxyAuthKey = key
+			if err := saveConfig(configPathEnv(), cfg); err != nil {
+				fmt.Printf("❌ 保存失败: %v\n", err)
+			} else {
+				fmt.Printf("✅ 代理鉴权 Key 已保存: %s\n", key)
+				fmt.Println("   客户端请求需携带: Authorization: Bearer " + key)
+			}
+		case "6":
+			fmt.Printf("当前上游地址: %s\n", cfg.UpstreamBase)
+			fmt.Print("输入新上游地址（如 https://dashscope.aliyuncs.com/compatible-mode/v1，回车恢复默认硅基）: ")
+			input := readLine(reader)
+			if input == "" {
+				cfg.UpstreamBase = defaultUpstream
+			} else {
+				if !strings.HasPrefix(input, "http://") && !strings.HasPrefix(input, "https://") {
+					fmt.Println("❌ 地址必须以 http:// 或 https:// 开头")
+					break
+				}
+				cfg.UpstreamBase = strings.TrimRight(input, "/")
 			}
 			if err := saveConfig(configPathEnv(), cfg); err != nil {
 				fmt.Printf("❌ 保存失败: %v\n", err)
 			} else {
-				fmt.Println("✅ 硅基 API Key 已保存")
+				fmt.Printf("✅ 上游地址已保存: %s\n", cfg.UpstreamBase)
 			}
-		case "5":
+		case "7":
+			manageRoutes(reader, &cfg)
+		case "8":
 			fmt.Println("前台启动中…（Ctrl+C 停止）")
 			if err := runServer(cfg); err != nil {
 				fmt.Printf("❌ 启动失败: %v\n", err)
 			}
-		case "6":
+		case "9":
 			fmt.Println(serviceStatus())
 		case "0", "q", "Q":
 			fmt.Println("再见 👋")
@@ -506,7 +699,6 @@ func interactive() {
 
 func main() {
 	logf("embed-proxy v%s starting (args: %s)", version, strings.Join(os.Args[1:], " "))
-
 	// --daemon: 服务模式，不起菜单
 	if len(os.Args) > 1 && os.Args[1] == "--daemon" {
 		cfgPath := configPathEnv()
@@ -526,7 +718,6 @@ func main() {
 		}
 		return
 	}
-
 	// 交互模式
 	interactive()
 }
