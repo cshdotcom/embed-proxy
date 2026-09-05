@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version         = "1.2.1"
+	version         = "1.2.2"
 	defaultPort     = 16540
 	defaultUpstream = "https://api.siliconflow.cn/v1"
 	configDir       = "/etc/embed-proxy"
@@ -445,17 +445,22 @@ func installService(cfg Config) error {
 		return err
 	}
 	if self != targetBin {
-		if _, err := os.Stat(targetBin); err == nil {
-			logf("[install] %s 已存在，跳过复制（该实例使用独立二进制）", targetBin)
-		} else {
-			if err := copyFile(self, targetBin); err != nil {
+		if err := copyFile(self, targetBin); err != nil {
+			if isTextFileBusy(err) {
+				// 目标二进制正被该实例服务运行：先停服务再复制，避免 ETXTBSY
+				logf("[install] %s 正在运行（text file busy），先停止服务 %s 再更新二进制…", targetBin, unitNameFor(currentInstance))
+				_ = systemctl("stop", unitNameFor(currentInstance))
+				if err2 := copyFile(self, targetBin); err2 != nil {
+					return fmt.Errorf("复制二进制到 %s 失败: %w", targetBin, err2)
+				}
+			} else {
 				return fmt.Errorf("复制二进制到 %s 失败: %w", targetBin, err)
 			}
-			if err := os.Chmod(targetBin, 0o755); err != nil {
-				return err
-			}
-			logf("[install] 二进制已复制到 %s", targetBin)
 		}
+		if err := os.Chmod(targetBin, 0o755); err != nil {
+			return err
+		}
+		logf("[install] 二进制已就位: %s", targetBin)
 	}
 	// 合并保留已有配置，再落盘
 	cfg = mergeExistingConfig(cfg)
@@ -545,6 +550,14 @@ func serviceStatus() string {
 	return fmt.Sprintf("服务状态: %s | 开机自启: %s | unit: %s", state, enabled, unit)
 }
 
+// isTextFileBusy 判断是否 ETXTBSY（目标可执行文件正在被运行）
+func isTextFileBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ETXTBSY) || strings.Contains(strings.ToLower(err.Error()), "text file busy")
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -565,7 +578,7 @@ func copyFile(src, dst string) error {
 func printBanner(cfg Config) {
 	status := "未安装"
 	if hasSystemd() {
-		cmd := exec.Command("systemctl", "is-active", serviceName)
+		cmd := exec.Command("systemctl", "is-active", unitNameFor(currentInstance))
 		if out, err := cmd.Output(); err == nil && strings.TrimSpace(string(out)) == "active" {
 			status = "运行中"
 		}

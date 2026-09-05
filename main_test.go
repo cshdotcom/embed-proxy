@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -262,5 +264,22 @@ func TestBinPathFor(t *testing.T) {
 	}
 	if got := binPathFor("b"); got != "/usr/local/bin/embed-proxy-b" {
 		t.Errorf("实例 b 二进制路径错误: %s", got)
+	}
+}
+
+// ---------- ETXTBSY ----------
+
+func TestIsTextFileBusy(t *testing.T) {
+	if isTextFileBusy(nil) {
+		t.Error("nil 不应判为 text file busy")
+	}
+	if !isTextFileBusy(syscall.ETXTBSY) {
+		t.Error("syscall.ETXTBSY 应被识别")
+	}
+	if !isTextFileBusy(errors.New("open /usr/local/bin/embed-proxy: text file busy")) {
+		t.Error("含 text file busy 的错误应被识别")
+	}
+	if isTextFileBusy(errors.New("permission denied")) {
+		t.Error("普通错误不应误判")
 	}
 }
