@@ -250,3 +250,17 @@ func TestInstanceNameValidation(t *testing.T) {
 		}
 	}
 }
+
+// ---------- 实例独立二进制 ----------
+
+func TestBinPathFor(t *testing.T) {
+	if got := binPathFor("default"); got != "/usr/local/bin/embed-proxy" {
+		t.Errorf("default 实例二进制路径错误: %s", got)
+	}
+	if got := binPathFor("a"); got != "/usr/local/bin/embed-proxy-a" {
+		t.Errorf("实例 a 二进制路径错误: %s", got)
+	}
+	if got := binPathFor("b"); got != "/usr/local/bin/embed-proxy-b" {
+		t.Errorf("实例 b 二进制路径错误: %s", got)
+	}
+}

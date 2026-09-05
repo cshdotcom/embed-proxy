@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	version         = "1.2.0"
+	version         = "1.2.1"
 	defaultPort     = 16540
 	defaultUpstream = "https://api.siliconflow.cn/v1"
 	configDir       = "/etc/embed-proxy"
@@ -118,6 +118,14 @@ func configPathFor(instance string) string {
 		return configPath
 	}
 	return filepath.Join(configDir, instance+".json")
+}
+
+// binPathFor 每个实例使用独立命名的二进制，default 兼容旧路径 /usr/local/bin/embed-proxy
+func binPathFor(instance string) string {
+	if instance == "" || instance == "default" {
+		return binPath
+	}
+	return "/usr/local/bin/embed-proxy-" + instance
 }
 
 func unitNameFor(instance string) string {
@@ -431,16 +439,22 @@ func installService(cfg Config) error {
 	if !hasSystemd() {
 		return errors.New("未检测到 systemd（/run/systemd/system 不存在），无法安装系统服务")
 	}
+	targetBin := binPathFor(currentInstance)
 	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	if self != binPath {
-		if err := copyFile(self, binPath); err != nil {
-			return fmt.Errorf("复制二进制到 %s 失败: %w", binPath, err)
-		}
-		if err := os.Chmod(binPath, 0o755); err != nil {
-			return err
+	if self != targetBin {
+		if _, err := os.Stat(targetBin); err == nil {
+			logf("[install] %s 已存在，跳过复制（该实例使用独立二进制）", targetBin)
+		} else {
+			if err := copyFile(self, targetBin); err != nil {
+				return fmt.Errorf("复制二进制到 %s 失败: %w", targetBin, err)
+			}
+			if err := os.Chmod(targetBin, 0o755); err != nil {
+				return err
+			}
+			logf("[install] 二进制已复制到 %s", targetBin)
 		}
 	}
 	// 合并保留已有配置，再落盘
@@ -461,7 +475,7 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-`, currentInstance, binPath, configPathEnv(), currentInstance)
+`, currentInstance, binPathFor(currentInstance), configPathEnv(), currentInstance)
 	if err := os.WriteFile(unitPathFor(currentInstance), []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("写入 systemd unit 失败: %w", err)
 	}
@@ -494,6 +508,11 @@ func uninstallService(keepConfig bool) error {
 	_ = systemctl("disable", "--now", unitNameFor(currentInstance))
 	_ = os.Remove(unitPathFor(currentInstance))
 	_ = systemctl("daemon-reload")
+	if currentInstance != "default" {
+		if err := os.Remove(binPathFor(currentInstance)); err == nil {
+			logf("[uninstall] 已删除实例二进制 %s", binPathFor(currentInstance))
+		}
+	}
 	if !keepConfig {
 		cfgPath := configPathFor(currentInstance)
 		_ = os.Remove(cfgPath)
@@ -857,6 +876,17 @@ func interactive() {
 
 func main() {
 	logf("embed-proxy v%s starting (args: %s)", version, strings.Join(os.Args[1:], " "))
+	for _, a := range os.Args[1:] {
+		if a == "--help" || a == "-h" {
+			fmt.Println("embed-proxy v" + version)
+			fmt.Println("用法: embed-proxy [--instance <name>] [--daemon] [--config <path>]")
+			fmt.Println("  --instance <name>  指定实例名（默认 default；命名实例独立配置/独立二进制/独立服务）")
+			fmt.Println("  --daemon           后台服务模式（由 systemd 调用）")
+			fmt.Println("  --config <path>    指定配置文件路径（默认按实例自动选择）")
+			fmt.Println("  不带参数启动进入交互菜单")
+			return
+		}
+	}
 	currentInstance = parseInstance()
 	// --daemon: 服务模式，不起菜单
 	if len(os.Args) > 1 && os.Args[1] == "--daemon" {
