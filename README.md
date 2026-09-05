@@ -10,6 +10,7 @@ SiliconFlow Embedding 清洗代理。解决 OpenWebUI / LiteLLM 调用硅基流�
 - **自定义上游地址**：默认硅基流动 `https://api.siliconflow.cn/v1`，可改为任意 OpenAI 兼容 API
 - 默认监听 `0.0.0.0:16540`，可被 gost / frp / cloudflared 等内网穿透工具直接转发
 - 启动弹出交互菜单：一键安装 systemd 服务（开机自启）、卸载、改端口、设 Key、改上游、管理路由
+- **多实例支持**：一套二进制跑多个互相独立的服务，各自端口/Key/上游/路由，互不干扰
 - 重装/升级服务时**自动合并保留已有配置**（API Key / 端口 / 上游 / 鉴权 Key / 路由不丢失）
 - 单文件静态二进制，无任何外部依赖
 
@@ -28,6 +29,21 @@ sudo ./embed-proxy
 4. `7` 管理自定义路由映射（添加/删除）
 5. `1` 安装为系统服务（开机自启动，自动保留已有配置）
 6. `3` 修改监听端口（默认 16540）
+7. `8` 切换/管理实例（多实例：列出全部实例、切换、新建）
+
+## 多实例
+
+一台机器可运行多个互相独立的实例，每个实例有独立配置与 systemd 服务：
+
+```bash
+sudo ./embed-proxy --instance a   # 实例 a: embed-proxy-a.service，配置 /etc/embed-proxy/a.json
+sudo ./embed-proxy --instance b   # 实例 b: embed-proxy-b.service，配置 /etc/embed-proxy/b.json
+```
+
+- `default` 为经典单实例（配置 `/etc/embed-proxy/config.json`，服务 `embed-proxy.service`），完全兼容旧部署
+- 每个实例可独立设置端口/上游/API Key/鉴权 Key/路由映射
+- 也可在菜单 `8` 中列出并切换实例，输入新名字即创建新实例
+- 实例名仅限字母/数字/下划线/中划线
 
 ## OpenWebUI 接入
 

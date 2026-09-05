@@ -1,4 +1,4 @@
-// embed-proxy v1.1.0
+// embed-proxy v1.2.0 (multi-instance)
 // SiliconFlow Embedding 清洗代理
 // 核心功能：
 //  1. 接收 /v1/embeddings，删除 encoding_format 字段后转发上游，解决 LiteLLM/OpenWebUI
@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,7 +36,7 @@ import (
 )
 
 const (
-	version         = "1.1.0"
+	version         = "1.2.0"
 	defaultPort     = 16540
 	defaultUpstream = "https://api.siliconflow.cn/v1"
 	configDir       = "/etc/embed-proxy"
@@ -45,6 +46,7 @@ const (
 	serviceName     = "embed-proxy.service"
 	envKeyVar       = "SILICONFLOW_API_KEY"
 	envPortVar      = "EMBED_PROXY_PORT"
+	envInstanceVar  = "EMBED_PROXY_INSTANCE"
 	requestTimeout  = 120 * time.Second
 	embeddingPath   = "/v1/embeddings"
 	maxBodySize     = 32 << 20
@@ -84,11 +86,82 @@ func defaultConfig() Config {
 	}
 }
 
+// currentInstance 当前实例名，default 为经典单实例（兼容旧部署路径）
+var currentInstance = "default"
+
+// parseInstance 从环境变量或 --instance 参数解析实例名
+func parseInstance() string {
+	if v := os.Getenv(envInstanceVar); v != "" {
+		return v
+	}
+	for i, a := range os.Args {
+		if a == "--instance" && i+1 < len(os.Args) {
+			return os.Args[i+1]
+		}
+	}
+	return "default"
+}
+
+// configPathEnv 当前实例的配置路径（EMBED_PROXY_CONFIG 显式指定时优先）
 func configPathEnv() string {
 	if v := os.Getenv("EMBED_PROXY_CONFIG"); v != "" {
 		return v
 	}
-	return configPath
+	if currentInstance == "" || currentInstance == "default" {
+		return configPath
+	}
+	return filepath.Join(configDir, currentInstance+".json")
+}
+
+func configPathFor(instance string) string {
+	if instance == "" || instance == "default" {
+		return configPath
+	}
+	return filepath.Join(configDir, instance+".json")
+}
+
+func unitNameFor(instance string) string {
+	if instance == "" || instance == "default" {
+		return serviceName
+	}
+	return "embed-proxy-" + instance + ".service"
+}
+
+func unitPathFor(instance string) string {
+	return filepath.Join("/etc/systemd/system", unitNameFor(instance))
+}
+
+// listInstances 从 systemd unit 与配置文件发现所有实例
+func listInstances() []string {
+	seen := map[string]bool{}
+	matches, _ := filepath.Glob("/etc/systemd/system/embed-proxy*.service")
+	for _, m := range matches {
+		name := strings.TrimSuffix(filepath.Base(m), ".service")
+		if strings.HasPrefix(name, "embed-proxy-") {
+			seen[strings.TrimPrefix(name, "embed-proxy-")] = true
+		} else {
+			seen["default"] = true
+		}
+	}
+	if entries, err := os.ReadDir(configDir); err == nil {
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			if e.Name() == "config.json" {
+				seen["default"] = true
+			} else {
+				seen[strings.TrimSuffix(e.Name(), ".json")] = true
+			}
+		}
+	}
+	seen["default"] = true
+	out := make([]string, 0, len(seen))
+	for n := range seen {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func loadConfig(path string) (Config, error) {
@@ -376,27 +449,27 @@ func installService(cfg Config) error {
 		return fmt.Errorf("写入配置失败: %w", err)
 	}
 	unit := fmt.Sprintf(`[Unit]
-Description=SiliconFlow Embedding Proxy (embed-proxy)
+Description=SiliconFlow Embedding Proxy (embed-proxy, instance=%s)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%s --daemon --config %s
+ExecStart=%s --daemon --config %s --instance %s
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-`, binPath, configPathEnv())
-	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+`, currentInstance, binPath, configPathEnv(), currentInstance)
+	if err := os.WriteFile(unitPathFor(currentInstance), []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("写入 systemd unit 失败: %w", err)
 	}
 	_ = systemctl("daemon-reload")
-	if err := systemctl("enable", "--now", serviceName); err != nil {
+	if err := systemctl("enable", "--now", unitNameFor(currentInstance)); err != nil {
 		return fmt.Errorf("systemctl enable --now 失败: %w", err)
 	}
-	logf("✅ 已安装并启动系统服务 %s（开机自启已启用）", serviceName)
+	logf("✅ 已安装并启动系统服务 %s（开机自启已启用）", unitNameFor(currentInstance))
 	logf("   监听端口: %d   健康检查: http://<host>:%d/healthz", cfg.Port, cfg.Port)
 	return nil
 }
@@ -418,34 +491,39 @@ func uninstallService(keepConfig bool) error {
 	if !hasSystemd() {
 		return errors.New("未检测到 systemd")
 	}
-	_ = systemctl("disable", "--now", serviceName)
-	_ = os.Remove(unitPath)
+	_ = systemctl("disable", "--now", unitNameFor(currentInstance))
+	_ = os.Remove(unitPathFor(currentInstance))
 	_ = systemctl("daemon-reload")
 	if !keepConfig {
-		_ = os.RemoveAll(configDir)
+		cfgPath := configPathFor(currentInstance)
+		_ = os.Remove(cfgPath)
+		if currentInstance == "default" {
+			_ = os.RemoveAll(configDir)
+		}
 	}
 	if keepConfig {
-		logf("✅ 已卸载系统服务（配置保留在 %s）", configPath)
+		logf("✅ 已卸载系统服务（实例 %s 配置保留在 %s）", currentInstance, configPathFor(currentInstance))
 	} else {
-		logf("✅ 已卸载系统服务并删除配置 %s", configDir)
+		logf("✅ 已卸载系统服务（实例 %s 配置已删除）", currentInstance)
 	}
 	return nil
 }
 
 func serviceStatus() string {
-	cmd := exec.Command("systemctl", "is-active", serviceName)
+	unit := unitNameFor(currentInstance)
+	cmd := exec.Command("systemctl", "is-active", unit)
 	out, _ := cmd.Output()
 	state := strings.TrimSpace(string(out))
 	if state == "" {
 		state = "未安装/未知"
 	}
 	enabled := "否"
-	cmd2 := exec.Command("systemctl", "is-enabled", serviceName)
+	cmd2 := exec.Command("systemctl", "is-enabled", unit)
 	out2, _ := cmd2.Output()
 	if strings.TrimSpace(string(out2)) == "enabled" {
 		enabled = "是"
 	}
-	return fmt.Sprintf("服务状态: %s | 开机自启: %s", state, enabled)
+	return fmt.Sprintf("服务状态: %s | 开机自启: %s | unit: %s", state, enabled, unit)
 }
 
 func copyFile(src, dst string) error {
@@ -477,6 +555,7 @@ func printBanner(cfg Config) {
 	fmt.Printf("  Embedding 清洗代理 v%s（硅基流动适配）\n", version)
 	fmt.Println("  功能: encoding_format 清洗 / 全局鉴权 / 自定义路由 / 自定义上游")
 	fmt.Println("--------------------------------------------------")
+	fmt.Printf("  当前实例 : %s\n", currentInstance)
 	fmt.Printf("  当前端口 : %d (默认 %d)\n", cfg.Port, defaultPort)
 	fmt.Printf("  上游地址 : %s\n", cfg.UpstreamBase)
 	fmt.Printf("  上游 Key : %s\n", maskKey(cfg.SiliconflowAPIKey))
@@ -490,8 +569,9 @@ func printBanner(cfg Config) {
 	fmt.Println("  5) 设置代理鉴权 Key（公网防滥用）")
 	fmt.Println("  6) 修改上游 API 地址（默认硅基流动）")
 	fmt.Println("  7) 管理自定义路由映射")
-	fmt.Println("  8) 前台启动代理（当前终端, Ctrl+C 停止）")
-	fmt.Println("  9) 查看服务状态")
+	fmt.Println("  8) 切换/管理实例（多实例）")
+	fmt.Println("  9) 前台启动代理（当前终端, Ctrl+C 停止）")
+	fmt.Println(" 10) 查看服务状态")
 	fmt.Println("  0) 退出")
 	fmt.Println("==================================================")
 }
@@ -568,6 +648,82 @@ func manageRoutes(reader *bufio.Reader, cfg *Config) {
 			fmt.Println("  ❌ 无效选项")
 		}
 	}
+}
+
+// manageInstances 列出所有实例并切换当前实例（可新建）
+func manageInstances(reader *bufio.Reader, cfg *Config) {
+	for {
+		instances := listInstances()
+		fmt.Println("--------------------------------------------------")
+		fmt.Println("  已发现实例:")
+		for i, name := range instances {
+			mark := " "
+			if name == currentInstance {
+				mark = "*"
+			}
+			st := ""
+			if hasSystemd() {
+				cmd := exec.Command("systemctl", "is-active", unitNameFor(name))
+				if out, err := cmd.Output(); err == nil {
+					st = " [" + strings.TrimSpace(string(out)) + "]"
+				}
+			}
+			// 尝试读端口显示
+			portStr := ""
+			if data, err := os.ReadFile(configPathFor(name)); err == nil {
+				var c Config
+				if json.Unmarshal(data, &c) == nil && c.Port > 0 {
+					portStr = fmt.Sprintf(" :%d", c.Port)
+				}
+			}
+			fmt.Printf("   %s %d. %s%s%s\n", mark, i+1, name, portStr, st)
+		}
+		fmt.Println("--------------------------------------------------")
+		fmt.Println("  输入编号切换实例；输入新名字创建实例；0 返回")
+		fmt.Print("  请选择: ")
+		opt := readLine(reader)
+		if opt == "0" {
+			return
+		}
+		if idx, err := strconv.Atoi(opt); err == nil && idx >= 1 && idx <= len(instances) {
+			currentInstance = instances[idx-1]
+			nc, err := loadConfig(configPathFor(currentInstance))
+			if err != nil {
+				nc = defaultConfig()
+			}
+			*cfg = nc
+			fmt.Printf("✅ 已切换到实例: %s（配置 %s）\n", currentInstance, configPathFor(currentInstance))
+			return
+		}
+		if opt != "" {
+			// 新实例名：仅允许字母数字与下划线
+			if !regexpMustValid(opt) {
+				fmt.Println("  ❌ 实例名只能包含字母/数字/下划线/中划线")
+				continue
+			}
+			currentInstance = opt
+			nc, err := loadConfig(configPathFor(currentInstance))
+			if err != nil {
+				nc = defaultConfig()
+			}
+			*cfg = nc
+			fmt.Printf("✅ 已切换到实例: %s（新实例，请用菜单配置并安装服务）\n", currentInstance)
+			return
+		}
+		fmt.Println("  ❌ 无效选择")
+	}
+}
+
+func regexpMustValid(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func interactive() {
@@ -679,11 +835,13 @@ func interactive() {
 		case "7":
 			manageRoutes(reader, &cfg)
 		case "8":
+			manageInstances(reader, &cfg)
+		case "9":
 			fmt.Println("前台启动中…（Ctrl+C 停止）")
 			if err := runServer(cfg); err != nil {
 				fmt.Printf("❌ 启动失败: %v\n", err)
 			}
-		case "9":
+		case "10":
 			fmt.Println(serviceStatus())
 		case "0", "q", "Q":
 			fmt.Println("再见 👋")
@@ -699,6 +857,7 @@ func interactive() {
 
 func main() {
 	logf("embed-proxy v%s starting (args: %s)", version, strings.Join(os.Args[1:], " "))
+	currentInstance = parseInstance()
 	// --daemon: 服务模式，不起菜单
 	if len(os.Args) > 1 && os.Args[1] == "--daemon" {
 		cfgPath := configPathEnv()

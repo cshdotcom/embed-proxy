@@ -195,3 +195,58 @@ func TestCustomUpstream(t *testing.T) {
 		t.Errorf("上游 Authorization 应替换为上游 Key，得到 %s", gotAuth)
 	}
 }
+
+// ---------- 多实例 ----------
+
+func TestConfigPathForInstance(t *testing.T) {
+	if got := configPathFor("default"); got != configPath {
+		t.Errorf("default 实例应使用 %s，得到 %s", configPath, got)
+	}
+	if got := configPathFor("a"); got != "/etc/embed-proxy/a.json" {
+		t.Errorf("实例 a 配置路径错误: %s", got)
+	}
+	if got := configPathFor("my-instance"); got != "/etc/embed-proxy/my-instance.json" {
+		t.Errorf("实例 my-instance 配置路径错误: %s", got)
+	}
+}
+
+func TestUnitNameForInstance(t *testing.T) {
+	if got := unitNameFor("default"); got != "embed-proxy.service" {
+		t.Errorf("default 实例 unit 名错误: %s", got)
+	}
+	if got := unitNameFor("b"); got != "embed-proxy-b.service" {
+		t.Errorf("实例 b unit 名错误: %s", got)
+	}
+}
+
+func TestParseInstance(t *testing.T) {
+	// 环境变量优先
+	os.Setenv(envInstanceVar, "env-inst")
+	defer os.Unsetenv(envInstanceVar)
+	if got := parseInstance(); got != "env-inst" {
+		t.Errorf("环境变量应优先，得到 %s", got)
+	}
+	os.Unsetenv(envInstanceVar)
+	if got := parseInstance(); got != "default" {
+		t.Errorf("无指定时默认 default，得到 %s", got)
+	}
+}
+
+func TestInstanceNameValidation(t *testing.T) {
+	cases := map[string]bool{
+		"a":       true,
+		"my-inst": true,
+		"my_inst": true,
+		"inst2":   true,
+		"":        false,
+		"a b":     false,
+		"a/b":     false,
+		"a.b":     false,
+		"中文":      false,
+	}
+	for name, want := range cases {
+		if got := regexpMustValid(name); got != want {
+			t.Errorf("regexpMustValid(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
